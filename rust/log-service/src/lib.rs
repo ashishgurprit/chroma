@@ -33,6 +33,7 @@ use chroma_types::chroma_proto::{
 use chroma_types::chroma_proto::{ForkLogsRequest, ForkLogsResponse};
 use chroma_types::dirty_log_path_from_hostname;
 use chroma_types::Cmek;
+use chroma_types::MultiCloudMultiRegionConfiguration;
 use chroma_types::{CollectionUuid, DirtyMarker};
 use figment::providers::{Env, Format, Yaml};
 use futures::stream::StreamExt;
@@ -133,6 +134,20 @@ pub enum Error {
     CouldNotGetDirtyLogReader,
     #[error("Dirty log writer failed to provide a cursor store")]
     CouldNotGetDirtyLogCursors,
+    #[error("configuration error: {0}")]
+    ConfigValidation(String),
+}
+
+impl ChromaError for Error {
+    fn code(&self) -> chroma_error::ErrorCodes {
+        match self {
+            Error::Wal3(_) => chroma_error::ErrorCodes::Internal,
+            Error::Json(_) => chroma_error::ErrorCodes::Internal,
+            Error::CouldNotGetDirtyLogReader => chroma_error::ErrorCodes::Internal,
+            Error::CouldNotGetDirtyLogCursors => chroma_error::ErrorCodes::Internal,
+            Error::ConfigValidation(_) => chroma_error::ErrorCodes::InvalidArgument,
+        }
+    }
 }
 
 ///////////////////////////////////////// InspectedLogState ////////////////////////////////////////
@@ -838,7 +853,7 @@ impl LogServer {
                 .map_err(|_| wal3::Error::internal(file!(), line!()))
                 .unwrap()
                 .as_micros() as u64,
-            writer: "TODO".to_string(),
+            writer: self.config.my_member_id.clone(),
         };
         let witness = if let Some(witness) = witness.as_ref() {
             cursor_store
@@ -2403,6 +2418,15 @@ pub struct OpenTelemetryConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct RegionalStorage {
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct TopologicalStorage {}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct LogServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
@@ -2413,7 +2437,7 @@ pub struct LogServerConfig {
     #[serde(default)]
     pub opentelemetry: Option<OpenTelemetryConfig>,
     #[serde(default)]
-    pub storage: StorageConfig,
+    pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub writer: LogWriterOptions,
     #[serde(default)]
@@ -2447,12 +2471,33 @@ pub struct LogServerConfig {
     pub grpc_shutdown_grace_period: Duration,
     #[serde(default = "LogServerConfig::default_grpc_max_concurrent_streams")]
     pub grpc_max_concurrent_streams: u32,
+    #[serde(default)]
+    pub regions_and_topologies:
+        Option<MultiCloudMultiRegionConfiguration<RegionalStorage, TopologicalStorage>>,
 }
 
 impl LogServerConfig {
     /// Should the log service allow mutable log operations?
     fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Validates that exactly one of storage or regions_and_topologies is set.
+    /// Returns a ChromaError if the XOR constraint is violated.
+    pub fn validate_storage_xor(&self) -> Result<(), Box<dyn ChromaError>> {
+        let storage_set = self.storage.is_some();
+        let regions_set = self.regions_and_topologies.is_some();
+
+        match (storage_set, regions_set) {
+            (true, true) => Err(Box::new(Error::ConfigValidation(
+                "storage and regions_and_topologies are mutually exclusive; exactly one must be set"
+                    .to_string(),
+            ))),
+            (false, false) => Err(Box::new(Error::ConfigValidation(
+                "exactly one of storage or regions_and_topologies must be set".to_string(),
+            ))),
+            (true, false) | (false, true) => Ok(()),
+        }
     }
 
     /// one hundred records on the log.
@@ -2507,7 +2552,7 @@ impl Default for LogServerConfig {
             my_member_id: LogServerConfig::default_my_member_id(),
             read_only: false,
             opentelemetry: None,
-            storage: StorageConfig::default(),
+            storage: None,
             writer: LogWriterOptions::default(),
             reader: LogReaderOptions::default(),
             dirty: None,
@@ -2522,6 +2567,7 @@ impl Default for LogServerConfig {
             max_decoding_message_size: Self::default_max_decoding_message_size(),
             grpc_shutdown_grace_period: Self::default_grpc_shutdown_grace_period(),
             grpc_max_concurrent_streams: Self::default_grpc_max_concurrent_streams(),
+            regions_and_topologies: None,
         }
     }
 }
@@ -2532,6 +2578,7 @@ impl Configurable<LogServerConfig> for LogServer {
         config: &LogServerConfig,
         registry: &chroma_config::registry::Registry,
     ) -> Result<Self, Box<dyn ChromaError>> {
+        config.validate_storage_xor()?;
         let cache: Option<Arc<dyn chroma_cache::PersistentCache<String, CachedBytes>>> =
             if let Some(cache_config) = &config.cache {
                 match chroma_cache::from_config_persistent::<String, CachedBytes>(cache_config)
@@ -2546,7 +2593,22 @@ impl Configurable<LogServerConfig> for LogServer {
             } else {
                 None
             };
-        let storage = Storage::try_from_config(&config.storage, registry).await?;
+        let storage_config = config
+            .storage
+            .as_ref()
+            .or_else(|| {
+                config
+                    .regions_and_topologies
+                    .as_ref()
+                    .and_then(|r| r.preferred_region_config())
+                    .map(|r| &r.storage)
+            })
+            .ok_or_else(|| {
+                Box::new(Error::ConfigValidation(
+                    "storage configuration is required for LogServer".to_string(),
+                )) as Box<dyn ChromaError>
+            })?;
+        let storage = Storage::try_from_config(storage_config, registry).await?;
         let storage = Arc::new(storage);
         let dirty_log_prefix = MarkDirty::path_for_hostname(&config.my_member_id);
         // Dirty log doesn't mark anything dirty (it is itself the dirty log).
@@ -3828,6 +3890,7 @@ mod tests {
                     .collect::<Result<_, _>>()
                     .expect("Logs should be valid"),
                 cmek: None,
+                database_name: "test_db".to_string(),
             });
             if let Err(err) = server.push_logs(proto_push_log_req).await {
                 if err.code() == Code::Unavailable {
@@ -3865,6 +3928,7 @@ mod tests {
                 start_from_offset: read_offset as i64,
                 batch_size: batch_size as i32,
                 end_timestamp: i64::MAX,
+                database_name: "test_db".to_string(),
             }))
             .await
             .expect("Pull Logs should not fail")
@@ -3902,6 +3966,7 @@ mod tests {
         server
             .scout_logs(Request::new(ScoutLogsRequest {
                 collection_id: collection_id.to_string(),
+                database_name: "test_db".to_string(),
             }))
             .await
             .expect("Scout Logs should not fail")
@@ -3921,6 +3986,7 @@ mod tests {
                 .update_collection_log_offset(Request::new(UpdateCollectionLogOffsetRequest {
                     collection_id: collection_id.to_string(),
                     log_offset: compact_offset,
+                    database_name: "test_db".to_string(),
                 }))
                 .await
             {
@@ -4001,6 +4067,7 @@ mod tests {
                 .garbage_collect_phase2(
                     GarbageCollectPhase2Request {
                         log_to_collect: Some(LogToCollect::CollectionId(collection_id.to_string())),
+                        database_name: "test_db".to_string(),
                     }
                     .into_request(),
                 )
@@ -4108,6 +4175,7 @@ mod tests {
                 .fork_logs(Request::new(ForkLogsRequest {
                     source_collection_id: source_collection_id.to_string(),
                     target_collection_id: fork_collection_id.to_string(),
+                    database_name: "test_db".to_string(),
                 }))
                 .await
                 .expect("Fork Logs should not fail");
@@ -4253,6 +4321,7 @@ mod tests {
                 start_from_offset: 7,
                 batch_size: 36,
                 end_timestamp: i64::MAX,
+                database_name: "test_db".to_string(),
             }))
             .await
             .expect("Pull Logs should not fail")
@@ -4415,6 +4484,7 @@ mod tests {
         let initial_request = UpdateCollectionLogOffsetRequest {
             collection_id: collection_id_str.clone(),
             log_offset: 100,
+            database_name: "test_db".to_string(),
         };
 
         let response = log_server
@@ -4430,6 +4500,7 @@ mod tests {
         let forward_request = UpdateCollectionLogOffsetRequest {
             collection_id: collection_id_str.clone(),
             log_offset: 150,
+            database_name: "test_db".to_string(),
         };
 
         let response = log_server
@@ -4441,6 +4512,7 @@ mod tests {
         let backward_request = UpdateCollectionLogOffsetRequest {
             collection_id: collection_id_str.clone(),
             log_offset: 50,
+            database_name: "test_db".to_string(),
         };
 
         let response = log_server
@@ -4458,6 +4530,7 @@ mod tests {
         let same_request = UpdateCollectionLogOffsetRequest {
             collection_id: collection_id_str.clone(),
             log_offset: 150, // Same as current
+            database_name: "test_db".to_string(),
         };
 
         let response = log_server
@@ -4469,6 +4542,7 @@ mod tests {
         let final_forward_request = UpdateCollectionLogOffsetRequest {
             collection_id: collection_id_str,
             log_offset: 200,
+            database_name: "test_db".to_string(),
         };
 
         let response = log_server
@@ -4477,6 +4551,120 @@ mod tests {
         assert!(
             response.is_ok(),
             "Forward movement after backward attempt should succeed"
+        );
+    }
+
+    #[test]
+    fn validate_storage_xor_both_none() {
+        let config = LogServerConfig {
+            storage: None,
+            regions_and_topologies: None,
+            ..Default::default()
+        };
+
+        let result = config.validate_storage_xor();
+        assert!(result.is_err(), "Both None should fail validation");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exactly one of storage or regions_and_topologies must be set"),
+            "Error message should mention exactly one must be set"
+        );
+    }
+
+    #[test]
+    fn validate_storage_xor_storage_only() {
+        let config = LogServerConfig {
+            storage: Some(StorageConfig::default()),
+            regions_and_topologies: None,
+            ..Default::default()
+        };
+
+        let result = config.validate_storage_xor();
+        assert!(
+            result.is_ok(),
+            "Storage set and regions_and_topologies None should pass"
+        );
+    }
+
+    #[test]
+    fn validate_storage_xor_regions_only() {
+        use chroma_types::ProviderRegion;
+        use chroma_types::RegionName;
+
+        let region_name = RegionName::new("test-region").unwrap();
+        let regions_and_topologies = MultiCloudMultiRegionConfiguration::new(
+            region_name.clone(),
+            vec![ProviderRegion::new(
+                region_name,
+                "test-provider",
+                "test-location",
+                RegionalStorage {
+                    storage: StorageConfig::default(),
+                },
+            )],
+            vec![],
+        )
+        .unwrap();
+
+        let config = LogServerConfig {
+            storage: None,
+            regions_and_topologies: Some(regions_and_topologies),
+            ..Default::default()
+        };
+
+        let result = config.validate_storage_xor();
+        assert!(
+            result.is_ok(),
+            "regions_and_topologies set and storage None should pass"
+        );
+    }
+
+    #[test]
+    fn validate_storage_xor_both_set() {
+        use chroma_types::ProviderRegion;
+        use chroma_types::RegionName;
+
+        let region_name = RegionName::new("test-region").unwrap();
+        let regions_and_topologies = MultiCloudMultiRegionConfiguration::new(
+            region_name.clone(),
+            vec![ProviderRegion::new(
+                region_name,
+                "test-provider",
+                "test-location",
+                RegionalStorage {
+                    storage: StorageConfig::default(),
+                },
+            )],
+            vec![],
+        )
+        .unwrap();
+
+        let config = LogServerConfig {
+            storage: Some(StorageConfig::default()),
+            regions_and_topologies: Some(regions_and_topologies),
+            ..Default::default()
+        };
+
+        let result = config.validate_storage_xor();
+        assert!(result.is_err(), "Both set should fail validation");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "Error message should mention mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn default_config_has_neither_set() {
+        let config = LogServerConfig::default();
+        assert!(
+            config.storage.is_none(),
+            "Default config should have storage as None"
+        );
+        assert!(
+            config.regions_and_topologies.is_none(),
+            "Default config should have regions_and_topologies as None"
         );
     }
 }
